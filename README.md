@@ -25,7 +25,7 @@
   </p>
 </div>
 <p align="center">
-  <a href='https://sihuiji.github.io/MemFlow-Page/'><img src='https://img.shields.io/badge/Project-Page-Green'></a>
+  <a href='https://sihuiji.github.io/MemFlow.github.io/'><img src='https://img.shields.io/badge/Project-Page-Green'></a>
   &nbsp;
   <a href='https://www.youtube.com/watch?v=7l7-WlIrgHg'><img src='https://img.shields.io/static/v1?label=Youtube&message=DemoVideo&color=yellow&logo=youtube'></a>
   &nbsp;
@@ -40,7 +40,7 @@
 - __[2025.12.14]__: Training and inference code, [model checkpoints](https://huggingface.co/KlingTeam/MemFlow) are available.
 <!-- - __[2025.09.25]__: [CamCloneMaster](https://arxiv.org/abs/2506.03140) has been accepted by SIGGRAPH Aisa 2025. -->
 <!-- - __[2025.09.08]__: [CameraClone Dataset](https://huggingface.co/datasets/KwaiVGI/CameraClone-Dataset/) is avaliable. -->
-- __[2025.12.14]__: Release the [project page](https://sihuiji.github.io/MemFlow-Page/) and the [Arxiv](https://arxiv.org/abs/2506.03140) version.
+- __[2025.12.14]__: Release the [project page](https://sihuiji.github.io/MemFlow.github.io/) and the [Arxiv]() version.
 
 ## 📷 Introduction
 **TL;DR:** 
