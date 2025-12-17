@@ -40,7 +40,7 @@
 - __[2025.12.14]__: Training and inference code, [model checkpoints](https://huggingface.co/KlingTeam/MemFlow) are available.
 <!-- - __[2025.09.25]__: [CamCloneMaster](https://arxiv.org/abs/2506.03140) has been accepted by SIGGRAPH Aisa 2025. -->
 <!-- - __[2025.09.08]__: [CameraClone Dataset](https://huggingface.co/datasets/KwaiVGI/CameraClone-Dataset/) is avaliable. -->
-- __[2025.12.14]__: Release the [project page](https://sihuiji.github.io/MemFlow.github.io/) and the [arXiv]() version.
+- __[2025.12.14]__: Release the [project page](https://sihuiji.github.io/MemFlow.github.io/) and the [arXiv](https://arxiv.org/abs/2512.14699) version.
 
 ## 📷 Introduction
 **TL;DR:** 
