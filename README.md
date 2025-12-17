@@ -29,7 +29,7 @@
   &nbsp;
   <a href='https://www.youtube.com/watch?v=7l7-WlIrgHg'><img src='https://img.shields.io/static/v1?label=Youtube&message=DemoVideo&color=yellow&logo=youtube'></a>
   &nbsp;
-  <a href=""><img src="https://img.shields.io/static/v1?label=Arxiv&message=MemFlow&color=red&logo=arxiv"></a>
+  <a href="https://arxiv.org/abs/2512.14699"><img src="https://img.shields.io/static/v1?label=Arxiv&message=MemFlow&color=red&logo=arxiv"></a>
   &nbsp;
   <a href='https://huggingface.co/KlingTeam/MemFlow'><img src='https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Model-orange'></a>
 </p>
@@ -40,7 +40,7 @@
 - __[2025.12.14]__: Training and inference code, [model checkpoints](https://huggingface.co/KlingTeam/MemFlow) are available.
 <!-- - __[2025.09.25]__: [CamCloneMaster](https://arxiv.org/abs/2506.03140) has been accepted by SIGGRAPH Aisa 2025. -->
 <!-- - __[2025.09.08]__: [CameraClone Dataset](https://huggingface.co/datasets/KwaiVGI/CameraClone-Dataset/) is avaliable. -->
-- __[2025.12.14]__: Release the [project page](https://sihuiji.github.io/MemFlow.github.io/) and the [Arxiv]() version.
+- __[2025.12.14]__: Release the [project page](https://sihuiji.github.io/MemFlow.github.io/) and the [arXiv]() version.
 
 ## 📷 Introduction
 **TL;DR:** 
@@ -182,9 +182,9 @@ Please leave us a star 🌟 and cite our paper if you find our work helpful.
       title={MemFlow: Flowing Adaptive Memory for Consistent and Efficient Long Video Narratives}, 
       author={Ji, Sihui and Chen, Xi and Yang, Shuai and Tao, Xin and Wan, Pengfei and Zhao, Hengshuang},
       year={2025},
-      eprint={2512.xxxxx},
+      eprint={2512.14699},
       archivePrefix={arXiv},
       primaryClass={cs.CV},
-      url={https://arxiv.org/abs/2512.xxxxx}, 
+      url={https://arxiv.org/abs/2512.14699}, 
 }
 ```
