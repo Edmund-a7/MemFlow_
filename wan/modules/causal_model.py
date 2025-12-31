@@ -101,91 +101,9 @@ class CausalWanSelfAttention(nn.Module):
         self.norm_q = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
 
-    def dynamic_topk_routing_attention(
-        self,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        chunk_size: int,
-        top_k: int,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Implements dynamic sparse attention via top-k chunk routing.
-        Args:
-            query (torch.Tensor): Query tensor of shape [B, L_q, H, D].
-            key (torch.Tensor): Key tensor of shape [B, L_kv, H, D].
-            value (torch.Tensor): Value tensor of shape [B, L_kv, H, D].
-            chunk_size (int): The size of each chunk to divide the key/value tensors into.
-            top_k (int): The number of top relevant chunks to select for each query.
+    # IAM: dynamic_topk_routing_attention (SMA) 已删除
+    # 由 IAM 的 entity-based 帧选择替代
 
-        Returns:
-            Returns K and V subsets compatible with a (B, L, H, D) attention function. 
-        """
-        B, L_q, H, D = query.shape
-        _, L_kv, _, _ = key.shape
-
-        # 1. Divide Key and Value into chunks
-        # Ensure L_kv is divisible by chunk_size, or handle padding
-        assert L_kv % chunk_size == 0, f"Key sequence length {L_kv} must be divisible by chunk_size {chunk_size}."
-        num_chunks = L_kv // chunk_size
-        # 6
-
-        # Reshape K and V to expose the chunk dimension
-        # K: [B, num_chunks, chunk_size, H, D]
-        key_chunks = key.view(B, num_chunks, chunk_size, H, D)
-        value_chunks = value.view(B, num_chunks, chunk_size, H, D)
-        
-        # 2. Compute descriptors (phi) for Q and K chunks using mean pooling
-        # Query descriptor (phi_q): [B, L_q, H, D] -> mean pool -> [B, 1, H, D]
-        # We compute one descriptor for the entire query sequence for simplicity,
-        # as described for q_i in the paper, where q_i is a single query token.
-        # To make it more granular, one could compute a descriptor per query token.
-        # For now, let's use one descriptor for all queries in the sequence.
-        phi_q = query.mean(dim=1, keepdim=True).permute(0, 2, 1, 3) # [B, H, 1, D]
-        # Key chunk descriptors (phi_k): [B, num_chunks, chunk_size, H, D] -> mean pool -> [B, num_chunks, H, D]
-        phi_k_chunks = key_chunks.mean(dim=2).permute(0, 2, 1, 3)  # [B, H, num_chunks, D]
-        # 3. Compute relevance scores (inner product)
-        # We need to compute scores between each query and each key chunk.
-        # Reshape for batch matrix multiplication:
-        # phi_q: [B, H, 1, D]
-        # phi_k_chunks: [B, H, num_chunks, D]
-        relevance_scores = torch.matmul(phi_q, phi_k_chunks.transpose(-2, -1)).squeeze(2) # [B, H, num_chunks]
-        # 3. Select top-k chunk indices
-        k_selected = min(top_k, num_chunks)
-        # Get indices of the top-k chunks for each head and batch item
-        _, top_k_indices = torch.topk(relevance_scores, k=k_selected, dim=-1) # [B, H, k_selected]
-        topk_indices_sorted, _ = torch.sort(top_k_indices, dim=-1)
-        # 4. Gather the selected Key and Value chunks
-        
-        # 4.1. Permute K/V chunks to align with indices' shape [B, H, ...] for gathering
-        # [B, num_chunks, chunk_size, H, D] -> [B, H, num_chunks, chunk_size, D]
-        key_chunks_permuted = key_chunks.permute(0, 3, 1, 2, 4)
-        value_chunks_permuted = value_chunks.permute(0, 3, 1, 2, 4)
-
-        # 4.2. Expand indices to match the dimensions of the chunks we want to gather
-        # [B, H, k_selected] -> [B, H, k_selected, chunk_size, D]
-        expanded_indices = topk_indices_sorted.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, -1, chunk_size, D)
-        
-        # 4.3. Gather along the 'num_chunks' dimension (dim=2)
-        selected_k = torch.gather(key_chunks_permuted, 2, expanded_indices)
-        selected_v = torch.gather(value_chunks_permuted, 2, expanded_indices)
-        # Shape of selected_k/v is now [B, H, k_selected, chunk_size, D]
-
-        # 5. Reshape and permute to the final target format
-        
-        # 5.1. Reshape to combine k_selected and chunk_size into a new length dimension
-        # [B, H, k_selected, chunk_size, D] -> [B, H, (k_selected * chunk_size), D]
-        L_selected = k_selected * chunk_size
-        final_k_bhld = selected_k.reshape(B, H, L_selected, D)
-        final_v_bhld = selected_v.reshape(B, H, L_selected, D)
-        
-        # 5.2. Permute from (B, H, L, D) to your desired (B, L, H, D) format
-        # [B, H, L_selected, D] -> [B, L_selected, H, D]
-        final_k = final_k_bhld.permute(0, 2, 1, 3)
-        final_v = final_v_bhld.permute(0, 2, 1, 3)
-        
-        return final_k, final_v
-    
     def forward(
         self,
         x,
@@ -456,26 +374,21 @@ class CausalWanSelfAttention(nn.Module):
                         local_end_index_bank_ = min(local_start_index_bank, kv_bank_size)
                     else:
                         local_end_index_bank_ = min(local_end_index_bank, kv_bank_size)
-                    
+
+                    # IAM: 直接使用 kv_bank["local_end_index"] 作为读取长度
+                    # 因为 IAM 的 _inject_iam_memory_to_bank 会直接设置这个值
+                    # 而不使用 MemFlow 的 current_end_bank 公式
+                    iam_bank_length = kv_bank["local_end_index"].item()
+                    if iam_bank_length > 0:
+                        # IAM 模式: 使用 IAM 注入的长度
+                        local_end_index_bank_ = min(iam_bank_length, kv_bank_size)
+
                     k_bank = bank_k[:, :local_end_index_bank_]
                     v_bank = bank_v[:, :local_end_index_bank_]
-                    if not self.SMA:
-                        k_cat = torch.cat([k_sink, k_bank, k_local], dim=1)
-                        v_cat = torch.cat([v_sink, v_bank, v_local], dim=1)
-                    else:
-                        k_global = torch.cat([k_sink, k_bank], dim=1)
-                        v_global = torch.cat([v_sink, v_bank], dim=1)
+                    # IAM: SMA (dynamic_topk_routing_attention) 已删除，直接拼接 k_bank
+                    k_cat = torch.cat([k_sink, k_bank, k_local], dim=1)
+                    v_cat = torch.cat([v_sink, v_bank, v_local], dim=1)
 
-                        k_global, v_global = self.dynamic_topk_routing_attention(
-                            query=roped_query,
-                            key=k_global,
-                            value=v_global,
-                            chunk_size=1560,
-                            top_k=3
-                        )
-                        k_cat = torch.cat([k_global, k_local], dim=1)
-                        v_cat = torch.cat([v_global, v_local], dim=1)
-                    
                 else:
                     k_cat = k_sink
                     v_cat = v_sink
@@ -1064,132 +977,10 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                 if update_bank:
                     kv_bank[block_index]["global_end_index"].fill_(current_end_bank)
                     kv_bank[block_index]["local_end_index"].fill_(local_end_index_bank)
-                
 
-    def _apply_cache_updates_before(self, kv_bank, crossattn_cache):
-        """
-        Applies cache updates collected from multiple blocks.
-        Args:
-            kv_cache: List of cache dictionaries for each block
-            cache_update_infos: List of (block_index, cache_update_info) tuples
-        """
-        for block_index, block in enumerate(self.blocks):
-            bank = kv_bank[block_index]
-            crossattn_cache_block = crossattn_cache[block_index]
-            write_end_index_bank = kv_bank[block_index]["local_end_index"]
-            if write_end_index_bank >= 1560:
-                write_start_index_bank = write_end_index_bank - 1560
-                new_k = bank["k_new"]
-                new_v = bank["v_new"]
-                with torch.no_grad():
-                    if write_end_index_bank <= bank["k"].shape[1]:
-                        bank["k"][:, write_start_index_bank:write_end_index_bank] = new_k
-                        bank["v"][:, write_start_index_bank:write_end_index_bank] = new_v
-                    else:
-                        new_compressed_kv_cache = self.compress_kv_bank(
-                            kv_cache=bank,
-                            new_k=new_k,
-                            new_v=new_v,
-                            crossattn_cache=crossattn_cache_block,
-                            tokens_per_block=1560,
-                            memory_budget_in_blocks=self.bank_size,
-                            num_prototypes_in_blocks=1,
-                        )
-                        bank["k"] = new_compressed_kv_cache["k"]
-                        bank["v"] = new_compressed_kv_cache["v"]
 
-    def compress_kv_bank(
-        self,
-        kv_cache: Dict[str, torch.Tensor],
-        new_k: torch.Tensor,
-        new_v: torch.Tensor,
-        crossattn_cache: Dict[str, torch.Tensor],
-        tokens_per_block: int = 1560,
-        memory_budget_in_blocks: int = 3,
-        num_prototypes_in_blocks: int = 1, # Represents the number of new blocks
-    ) -> Dict[str, torch.Tensor]:
-        """
-        Compresses historical KV cache by selecting top-k salient blocks based on full
-        attention scores, and then concatenates them with all new blocks.
-
-        Args:
-            kv_cache (Dict): Historical KV cache. 'k'/'v' shape: [B, L_hist, H, D].
-            new_k, new_v (torch.Tensor): New K/V for generated chunks. Shape: [B, L_new, H, D].
-            crossattn_cache (Dict): Text prompt KV cache, 'k' is used as query.
-            tokens_per_block (int): Number of tokens per video block.
-            memory_budget_in_blocks (int): Total number of blocks to keep in the new cache.
-            num_prototypes_in_blocks (int): The number of new blocks being added.
-
-        Returns:
-            Dict[str, torch.Tensor]: The new, compressed KV cache dictionary.
-        """
-        # --- Step 0: Prepare Tensors and Information ---
-        hist_k, hist_v = kv_cache['k'], kv_cache['v']
-        text_q = crossattn_cache["k"]
-
-        B, L_hist, H, D = hist_k.shape
-        L_new = new_k.shape[1]
-
-        if L_hist % tokens_per_block != 0 or L_new % tokens_per_block != 0:
-            raise ValueError("Cache lengths must be multiples of tokens_per_block.")
-            
-        num_hist_blocks = L_hist // tokens_per_block
-        num_new_blocks = L_new // tokens_per_block
-        
-        # num_prototypes_in_blocks seems to represent num_new_blocks in this logic
-        num_hist_to_keep = memory_budget_in_blocks - num_new_blocks
-
-        # --- Step 1: Compute Saliency Scores for Historical Blocks (Full Attention) ---
-        
-        # Prepare Q (text) and K (historical visual) for batch matrix multiplication
-        q_reshaped = text_q.permute(0, 2, 1, 3).reshape(B * H, -1, D)
-        k_reshaped = hist_k.permute(0, 2, 1, 3).reshape(B * H, L_hist, D)
-
-        # Compute attention scores: [B*H, L_text, L_hist]
-        attn_scores = torch.bmm(q_reshaped, k_reshaped.transpose(1, 2)) * (D ** -0.5)
-
-        # Aggregate scores to get a single saliency value per historical block
-        # 1. Average over text tokens: [B*H, L_hist]
-        # 2. Reshape and average over heads: [B, L_hist]
-        # 3. Reshape and average over tokens within each block: [B, num_hist_blocks]
-        importance_scores_per_block = attn_scores.mean(dim=1) \
-                                                .view(B, H, L_hist) \
-                                                .mean(dim=1) \
-                                                .view(B, num_hist_blocks, tokens_per_block) \
-                                                .mean(dim=2)
-
-        # --- Step 2: Select Top-K Salient Historical Blocks ---
-        
-        k_to_select = min(num_hist_to_keep, num_hist_blocks)
-        _, topk_indices = torch.topk(importance_scores_per_block, k=k_to_select, dim=1)
-        
-        # Gather the most salient historical blocks
-        hist_k_blocks = hist_k.view(B, num_hist_blocks, tokens_per_block, H, D)
-        hist_v_blocks = hist_v.view(B, num_hist_blocks, tokens_per_block, H, D)
-        
-        expanded_indices = topk_indices.view(B, k_to_select, 1, 1, 1).expand(-1, -1, tokens_per_block, H, D)
-        
-        salient_k_blocks = torch.gather(hist_k_blocks, 1, expanded_indices)
-        salient_v_blocks = torch.gather(hist_v_blocks, 1, expanded_indices)
-
-        # --- Step 3: Construct the Final Compressed Cache ---
-
-        # Reshape new blocks and concatenate with salient historical blocks
-        new_k_blocks = new_k.view(B, num_new_blocks, tokens_per_block, H, D)
-        new_v_blocks = new_v.view(B, num_new_blocks, tokens_per_block, H, D)
-
-        # Concatenate in block view, then reshape to final token sequence
-        final_k_blocks = torch.cat([salient_k_blocks, new_k_blocks], dim=1)
-        final_v_blocks = torch.cat([salient_v_blocks, new_v_blocks], dim=1)
-
-        final_num_tokens = (k_to_select + num_new_blocks) * tokens_per_block
-        final_k = final_k_blocks.reshape(B, final_num_tokens, H, D)
-        final_v = final_v_blocks.reshape(B, final_num_tokens, H, D)
-        
-        return {
-            "k": final_k,
-            "v": final_v,
-        }
+    # IAM: _apply_cache_updates_before 和 compress_kv_bank 已删除
+    # 由 IAM 的 MemoryBank.select_frame_from_chunk() 替代
 
     def _forward_inference(
         self,
@@ -1300,8 +1091,9 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             def custom_forward(*inputs, **kwargs):
                 return module(*inputs, **kwargs)
             return custom_forward
-        if kv_bank is not None and q_bank:
-            self._apply_cache_updates_before(kv_bank, crossattn_cache)
+
+        # IAM: NAM 帧选择已删除，由 IAM 的 entity-based 帧选择替代
+        # 原代码: if kv_bank is not None and q_bank: self._apply_cache_updates_before(kv_bank, crossattn_cache)
 
         cache_update_info = None
         cache_update_infos = []  # Collect cache update info for all blocks
