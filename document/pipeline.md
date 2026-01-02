@@ -1,4 +1,29 @@
-项目完整流程详解（最终版）
+# IAM Flow Pipeline 说明
+
+## 两种推理模式
+
+### 1. agent_inference.py - 单 Prompt 生成
+- **用途**: 从单个文本 prompt 生成视频，类似 MemFlow 的 inference.py
+- **特点**:
+  - 使用 AgentCausalInferencePipeline（包含 IAM 能力）
+  - 不涉及 prompt 切换
+  - 适合简单的文本到视频生成任务
+- **配置文件**: `configs/agent_inference.yaml`
+- **运行**: `bash agent_inference.sh`
+
+### 2. agent_interactive_inference.py - 交互式多 Prompt 生成
+- **用途**: 多 prompt 交互式视频生成，支持场景切换
+- **特点**:
+  - 使用 AgentCausalInferencePipeline 的完整功能
+  - LLM Agent 进行实体提取和 ID 匹配
+  - Memory Bank 进行帧选择和记忆管理
+  - 支持在指定帧切换 prompt
+- **配置文件**: `configs/agent_interactive_inference.yaml`
+- **运行**: `bash agent_interactive_inference.sh`
+
+---
+
+## 项目完整流程详解（交互式模式）
 基本设定:
 每个 prompt 生成 10 个 chunk，每个 chunk 3 帧
 KV Cache 结构: [Sink(3帧) + Mem(3帧) + Local(6帧)]

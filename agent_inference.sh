@@ -1,19 +1,14 @@
 #!/bin/bash
-# IAM Agent Inference Script
-# Usage: bash agent_inference.sh [NUM_GPUS] [CONFIG_PATH]
-
-
+# IAM Agent Single Prompt Inference Script
+# Similar to MemFlow's inference.sh but uses IAM capabilities
+# Usage: bash agent_inference.sh
 
 echo "=========================================="
-echo "IAM Agent Inference"
+echo "IAM Agent Single Prompt Inference"
 echo "=========================================="
 
-
-CUDA_VISIBLE_DEVICES=0,1 torchrun \
-  --nproc_per_node=2 \
-  --master_port=29502 \
+CUDA_VISIBLE_DEVICES=0 torchrun \
+  --nproc_per_node=1 \
+  --master_port=29501 \
   agent_inference.py \
-  --config_path configs/agent_inference.yaml \
-  --llm_model_path ../Qwen3-0.6B \
-  --max_memory_frames 3 \
-  --save_dir data/agent_frames
+  --config_path configs/agent_inference.yaml

@@ -8,13 +8,15 @@
 #
 # SPDX-License-Identifier: CC-BY-NC-SA-4.0
 """
-IAM Agent Single Prompt Inference Script
+IAM Agent Interactive Inference Script
 
-Similar to MemFlow's inference.py but uses AgentCausalInferencePipeline for IAM capabilities.
-Generates video from a single text prompt (no interactive multi-prompt switching).
+Multi-prompt interactive video generation with prompt switching.
+使用 AgentCausalInferencePipeline 进行交互式视频生成推理
+整合 LLM Agent (实体提取和 ID 匹配) 和 Memory Bank (帧选择)
 """
 import argparse
 import os
+from typing import List
 
 import torch
 import torch.distributed as dist
@@ -26,22 +28,25 @@ from torchvision.io import write_video
 from einops import rearrange
 
 from utils.misc import set_seed
-from utils.dataset import TextDataset
-from utils.memory import get_cuda_free_memory_gb, DynamicSwapInstaller
+from utils.distributed import barrier
+from utils.memory import gpu, get_cuda_free_memory_gb, DynamicSwapInstaller
 
 from pipeline.agent_causal_inference import AgentCausalInferencePipeline
+from utils.dataset import MultiTextDataset
 
 
 # ----------------------------- Argument parsing -----------------------------
-parser = argparse.ArgumentParser("IAM Agent single prompt inference")
+parser = argparse.ArgumentParser("IAM Agent causal inference")
 parser.add_argument("--config_path", type=str, help="Path to the config file")
-# IAM-specific arguments (optional, for advanced usage)
-parser.add_argument("--llm_model_path", type=str, default=None,
+# IAM-specific arguments
+parser.add_argument("--llm_model_path", type=str, default="../Qwen3-0.6B",
                     help="Path to the LLM model for entity extraction")
-parser.add_argument("--max_memory_frames", type=int, default=None,
+parser.add_argument("--max_memory_frames", type=int, default=3,
                     help="Maximum number of memory frames to keep")
-parser.add_argument("--save_dir", type=str, default=None,
+parser.add_argument("--save_dir", type=str, default="data/agent_frames",
                     help="Directory to save frame data")
+parser.add_argument("--mapping_path", type=str, default=None,
+                    help="Path to save mapping.json (default: output_folder/mapping.json)")
 args = parser.parse_args()
 
 config = OmegaConf.load(args.config_path)
@@ -56,9 +61,11 @@ if "LOCAL_RANK" in os.environ:
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     rank = int(os.environ.get("RANK", str(local_rank)))
 
+    # Set device first
     torch.cuda.set_device(local_rank)
     device = torch.device(f"cuda:{local_rank}")
 
+    # Initialize process group with backend and timeout
     if not dist.is_initialized():
         dist.init_process_group(
             backend="nccl",
@@ -67,32 +74,28 @@ if "LOCAL_RANK" in os.environ:
             timeout=torch.distributed.constants.default_pg_timeout
         )
 
-    set_seed(config.seed + local_rank)
-    config.distributed = True
-    if rank == 0:
-        print(f"[Rank {rank}] Initialized distributed processing on device {device}")
+    set_seed(config.seed)
+    print(f"[Rank {rank}] Initialized distributed processing on device {device}")
 else:
     local_rank = 0
     rank = 0
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     set_seed(config.seed)
-    config.distributed = False
     print(f"Single GPU mode on device {device}")
 
-print(f"Free VRAM {get_cuda_free_memory_gb(device)} GB")
-low_memory = get_cuda_free_memory_gb(device) < 40 if torch.cuda.is_available() else False
 
+low_memory = get_cuda_free_memory_gb(device) < 40 if torch.cuda.is_available() else False
 torch.set_grad_enabled(False)
 
 # ----------------------------- Create IAM Pipeline -----------------------------
-# Resolve IAM parameters from config or command line
-llm_model_path = args.llm_model_path or getattr(config, "llm_model_path", "../Qwen3-0.6B")
-max_memory_frames = args.max_memory_frames if args.max_memory_frames is not None else getattr(config, "max_memory_frames", 3)
-save_dir = args.save_dir or getattr(config, "save_dir", "data/agent_frames")
+# Resolve IAM parameters: command line args override config file
+llm_model_path = args.llm_model_path if args.llm_model_path != "../Qwen3-0.6B" else getattr(config, "llm_model_path", "../Qwen3-0.6B")
+max_memory_frames = args.max_memory_frames if args.max_memory_frames != 3 else getattr(config, "max_memory_frames", 3)
+save_dir = args.save_dir if args.save_dir != "data/agent_frames" else getattr(config, "save_dir", "data/agent_frames")
 
 if local_rank == 0:
     print("=" * 60)
-    print("IAM Agent Single Prompt Inference")
+    print("IAM Agent Causal Inference Pipeline")
     print("=" * 60)
     print(f"LLM Model Path: {llm_model_path}")
     print(f"Max Memory Frames: {max_memory_frames}")
@@ -110,12 +113,7 @@ pipeline = AgentCausalInferencePipeline(
 # ----------------------------- Load base checkpoint -----------------------------
 if config.generator_ckpt:
     state_dict = torch.load(config.generator_ckpt, map_location="cpu")
-    if "generator" in state_dict or "generator_ema" in state_dict:
-        raw_gen_state_dict = state_dict["generator_ema" if config.use_ema else "generator"]
-    elif "model" in state_dict:
-        raw_gen_state_dict = state_dict["model"]
-    else:
-        raise ValueError(f"Generator state dict not found in {config.generator_ckpt}")
+    raw_gen_state_dict = state_dict["generator_ema" if config.use_ema else "generator"]
 
     if config.use_ema:
         def _clean_key(name: str) -> str:
@@ -142,7 +140,7 @@ if getattr(config, "adapter", None) and configure_lora_for_model is not None:
     if local_rank == 0:
         print(f"LoRA enabled with config: {config.adapter}")
         print("Applying LoRA to generator (inference)...")
-
+    # After loading base weights, apply LoRA wrapper to the generator's transformer model
     pipeline.generator.model = configure_lora_for_model(
         pipeline.generator.model,
         model_name="generator",
@@ -150,11 +148,13 @@ if getattr(config, "adapter", None) and configure_lora_for_model is not None:
         is_main_process=(local_rank == 0),
     )
 
+    # Load LoRA weights (if lora_ckpt is provided)
     lora_ckpt_path = getattr(config, "lora_ckpt", None)
     if lora_ckpt_path:
         if local_rank == 0:
             print(f"Loading LoRA checkpoint from {lora_ckpt_path}")
         lora_checkpoint = torch.load(lora_ckpt_path, map_location="cpu")
+        # Support both formats: containing the `generator_lora` key or a raw LoRA state dict
         if isinstance(lora_checkpoint, dict) and "generator_lora" in lora_checkpoint:
             peft.set_peft_model_state_dict(pipeline.generator.model, lora_checkpoint["generator_lora"])
         else:
@@ -168,6 +168,7 @@ if getattr(config, "adapter", None) and configure_lora_for_model is not None:
     pipeline.is_lora_enabled = True
 
 # Move pipeline to appropriate dtype and device
+print("dtype", pipeline.generator.model.dtype)
 pipeline = pipeline.to(dtype=torch.bfloat16)
 if low_memory:
     DynamicSwapInstaller.install_model(pipeline.text_encoder, device=device)
@@ -175,15 +176,29 @@ pipeline.generator.to(device=device)
 pipeline.vae.to(device=device)
 
 # ----------------------------- Build dataset -----------------------------
-extended_prompt_path = config.data_path
-dataset = TextDataset(prompt_path=config.data_path, extended_prompt_path=extended_prompt_path)
-num_prompts = len(dataset)
-print(f"Number of prompts: {num_prompts}")
+# Parse switch_frame_indices
+switch_frame_indices: List[int] = [int(x) for x in config.switch_frame_indices.split(",") if x.strip()]
+
+# Create dataset
+dataset = MultiTextDataset(config.data_path)
+
+# Validate number of segments & switch_frame_indices length
+num_segments = len(dataset[0]["prompts_list"])
+assert len(switch_frame_indices) == num_segments - 1, (
+    "The number of switch_frame_indices should be the number of prompt segments minus 1"
+)
+
+print("Number of segments:", num_segments)
+print("Switch frame indices:", switch_frame_indices)
+
+num_prompts_total = len(dataset)
+print(f"Number of prompt lines: {num_prompts_total}")
 
 if dist.is_initialized():
     sampler = DistributedSampler(dataset, shuffle=False, drop_last=True)
 else:
     sampler = SequentialSampler(dataset)
+
 dataloader = DataLoader(dataset, batch_size=1, sampler=sampler, num_workers=0, drop_last=False)
 
 # Create output directory
@@ -196,81 +211,71 @@ if dist.is_initialized():
 
 # ----------------------------- Inference loop -----------------------------
 for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
-    idx = batch_data['idx'].item()
-
-    # Unpack batch data
-    if isinstance(batch_data, dict):
-        batch = batch_data
-    elif isinstance(batch_data, list):
-        batch = batch_data[0]
-
-    all_video = []
-    num_generated_frames = 0
-
-    # Get prompt
-    prompt = batch['prompts'][0]
-    extended_prompt = batch['extended_prompts'][0] if 'extended_prompts' in batch else None
-    if extended_prompt is not None:
-        prompts = [extended_prompt] * config.num_samples
-    else:
-        prompts = [prompt] * config.num_samples
+    idx = batch_data["idx"].item()
+    prompts_list: List[str] = batch_data["prompts_list"]  # type: ignore
 
     sampled_noise = torch.randn(
-        [config.num_samples, config.num_output_frames, 16, 60, 104],
+        [
+            config.num_samples,
+            config.num_output_frames,
+            16,
+            60,
+            104,
+        ],
         device=device,
-        dtype=torch.bfloat16
+        dtype=torch.bfloat16,
     )
 
-    if local_rank == 0:
-        print(f"Processing prompt: {prompts[0][:100]}...")
+    # Determine mapping path for this sample
+    if args.mapping_path:
+        mapping_path = args.mapping_path
+    else:
+        mapping_path = os.path.join(config.output_folder, f"mapping_{idx}.json")
 
-    # For single prompt inference, we wrap it as a single-segment list
-    text_prompts_list = [[p] for p in prompts]  # Each sample gets a list with one prompt
-
-    # Generate video using IAM pipeline (single segment, no switching)
+    # IAM Agent inference
     video = pipeline.inference(
         noise=sampled_noise,
-        text_prompts_list=text_prompts_list,
-        switch_frame_indices=[],  # No switching for single prompt
+        text_prompts_list=prompts_list,
+        switch_frame_indices=switch_frame_indices,
         return_latents=False,
         low_memory=low_memory,
-        save_mapping=False,  # Don't need mapping for single prompt
+        save_mapping=True,
+        mapping_path=mapping_path,
     )
 
-    current_video = rearrange(video, 'b t c h w -> b t h w c').cpu()
-    all_video.append(current_video)
-    num_generated_frames += video.shape[1]
-
-    # Final output video
-    video_out = 255.0 * torch.cat(all_video, dim=1)
-
-    # Clear VAE cache
-    pipeline.vae.model.clear_cache()
+    current_video = rearrange(video, "b t c h w -> b t h w c").cpu() * 255.0
 
     if dist.is_initialized():
         rank = dist.get_rank()
     else:
         rank = 0
 
-    # Save the video if the current prompt is not a dummy prompt
-    if idx < num_prompts:
-        # Determine model type for filename
-        if hasattr(pipeline, 'is_lora_enabled') and pipeline.is_lora_enabled:
-            model_type = "iam_lora"
-        elif getattr(config, 'use_ema', False):
-            model_type = "iam_ema"
+    # Determine model type for filename
+    if hasattr(pipeline, 'is_lora_enabled') and pipeline.is_lora_enabled:
+        model_type = "iam_lora"
+    elif getattr(config, 'use_ema', False):
+        model_type = "iam_ema"
+    else:
+        model_type = "iam"
+
+    for seed_idx in range(config.num_samples):
+        if config.save_with_index:
+            output_path = os.path.join(config.output_folder, f"rank{rank}-{idx}-{seed_idx}_{model_type}.mp4")
         else:
-            model_type = "iam"
+            # Use the first prompt segment as the filename prefix to avoid overly long names
+            short_name = prompts_list[0][0][:100].replace("/", "_")
+            output_path = os.path.join(config.output_folder, f"rank{rank}-{short_name}-{seed_idx}_{model_type}.mp4")
+        write_video(output_path, current_video[seed_idx].to(torch.uint8), fps=16)
 
-        for seed_idx in range(config.num_samples):
-            if config.save_with_index:
-                output_path = os.path.join(config.output_folder, f'rank{rank}-{idx}-{seed_idx}_{model_type}.mp4')
-            else:
-                output_path = os.path.join(config.output_folder, f'rank{rank}-{prompt[:100]}-{seed_idx}.mp4')
-            write_video(output_path, video_out[seed_idx].to(torch.uint8), fps=16)
+    if local_rank == 0:
+        print(f"[IAM] Saved video to {output_path}")
+        print(f"[IAM] Saved mapping to {mapping_path}")
 
-        if local_rank == 0:
-            print(f"[IAM] Saved video to {output_path}")
+        # Print agent status
+        status = pipeline.get_agent_status()
+        print(f"[IAM] Final registry entities: {len(status['global_registry'])}")
+        print(f"[IAM] Frame archive count: {status['frame_archive_count']}")
+        print(f"[IAM] Active memory frames: {status['active_memory']}")
 
     if config.inference_iter != -1 and i >= config.inference_iter:
         break
@@ -280,5 +285,5 @@ if dist.is_initialized():
 
 if local_rank == 0:
     print("=" * 60)
-    print("IAM Agent Single Prompt Inference Complete!")
+    print("IAM Agent Inference Complete!")
     print("=" * 60)

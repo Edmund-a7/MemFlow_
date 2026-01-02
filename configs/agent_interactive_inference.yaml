@@ -1,5 +1,5 @@
-# IAM Agent Single Prompt Inference Configuration
-# Based on inference.yaml with IAM-specific settings
+# IAM Agent Inference Configuration
+# Based on interactive_inference.yaml with IAM-specific settings
 
 # Architecture
 denoising_step_list:
@@ -19,14 +19,15 @@ model_kwargs:
   SMA: False  # IAM replaces MemFlow's SMA
 
 # Inference
-data_path: prompts/vidprom_filtered_extended.txt
-output_folder: videos/iam_single_prompt
+data_path: prompts/interactive_example.jsonl
+output_folder: videos/iam_output
 inference_iter: -1
-num_output_frames: 120
+num_output_frames: 240
 use_ema: false
-seed: 0
+seed: 1
 num_samples: 1
 save_with_index: true
+switch_frame_indices: 40, 80, 120, 160, 200
 global_sink: true
 context_noise: 0
 
@@ -43,7 +44,7 @@ adapter:
   dtype: "bfloat16"
   verbose: false
 
-# IAM Agent Settings (optional for single prompt, but available)
+# IAM Agent Settings (can be overridden via command line)
 llm_model_path: ../Qwen3-0.6B
 max_memory_frames: 3
 save_dir: data/agent_frames
