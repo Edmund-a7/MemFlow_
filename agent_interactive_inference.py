@@ -241,6 +241,7 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
         low_memory=low_memory,
         save_mapping=True,
         mapping_path=mapping_path,
+        profile=True,  # Enable profiling
     )
 
     current_video = rearrange(video, "b t c h w -> b t h w c").cpu() * 255.0

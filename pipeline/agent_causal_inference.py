@@ -105,7 +105,8 @@ class AgentCausalInferencePipeline(InteractiveCausalInferencePipeline):
         return_latents: bool = False,
         low_memory: bool = False,
         save_mapping: bool = True,
-        mapping_path: str = "mapping.json"):
+        mapping_path: str = "mapping.json",
+        profile: bool = False):
         """
         带 Agent 的视频生成推理 (完全替代 MemFlow 帧选择)
 
@@ -117,6 +118,7 @@ class AgentCausalInferencePipeline(InteractiveCausalInferencePipeline):
             low_memory: 低内存模式
             save_mapping: 是否保存 mapping.json
             mapping_path: mapping.json 保存路径
+            profile: 是否启用性能分析
 
         Returns:
             生成的视频 (和 latent)
@@ -126,6 +128,29 @@ class AgentCausalInferencePipeline(InteractiveCausalInferencePipeline):
         assert len(switch_frame_indices) == len(text_prompts_list) - 1
         assert num_output_frames % self.num_frame_per_block == 0
         num_blocks = num_output_frames // self.num_frame_per_block
+
+        # ===== Profiling Setup =====
+        if profile:
+            init_start = torch.cuda.Event(enable_timing=True)
+            init_end = torch.cuda.Event(enable_timing=True)
+            diffusion_start = torch.cuda.Event(enable_timing=True)
+            diffusion_end = torch.cuda.Event(enable_timing=True)
+            vae_start = torch.cuda.Event(enable_timing=True)
+            vae_end = torch.cuda.Event(enable_timing=True)
+            block_start = torch.cuda.Event(enable_timing=True)
+            block_end = torch.cuda.Event(enable_timing=True)
+
+            # IAM specific timers
+            agent_start = torch.cuda.Event(enable_timing=True)
+            agent_end = torch.cuda.Event(enable_timing=True)
+            memory_start = torch.cuda.Event(enable_timing=True)
+            memory_end = torch.cuda.Event(enable_timing=True)
+
+            block_times = []
+            agent_times = []  # Per-prompt agent processing time
+            memory_times = []  # Per-chunk memory bank time
+
+            init_start.record()
 
         # 重置状态
         self._reset_agent_state()
@@ -177,6 +202,11 @@ class AgentCausalInferencePipeline(InteractiveCausalInferencePipeline):
         self.generator.model.local_attn_size = self.local_attn_size
         self._set_all_modules_max_attention_size(self.local_attn_size)
 
+        if profile:
+            init_end.record()
+            torch.cuda.synchronize()
+            diffusion_start.record()
+
         # 时序循环
         all_num_frames = [self.num_frame_per_block] * num_blocks
         segment_idx = 0
@@ -187,16 +217,28 @@ class AgentCausalInferencePipeline(InteractiveCausalInferencePipeline):
         )
 
         # ===== 处理第一个 prompt =====
+        if profile:
+            agent_start.record()
+
         self._process_prompt_start(
             prompt_text=text_prompts_list[0][0],
             prompt_id=1,
             is_first_prompt=True
         )
 
+        if profile:
+            agent_end.record()
+            torch.cuda.synchronize()
+            agent_time = agent_start.elapsed_time(agent_end)
+            agent_times.append(("Prompt 1", agent_time))
+
         for block_idx, current_num_frames in enumerate(all_num_frames):
             # ===== 关键: 始终禁用 MemFlow 的 bank 更新 =====
             # IAM 会自己管理 bank
             update_bank = False
+
+            if profile:
+                block_start.record()
 
             # ===== 1. 检测 prompt 切换 =====
             if next_switch_pos is not None and current_start_frame >= next_switch_pos:
@@ -207,12 +249,21 @@ class AgentCausalInferencePipeline(InteractiveCausalInferencePipeline):
                 self._recache_after_switch(output, current_start_frame, cond_list[segment_idx])
 
                 # ===== 3. LLM Agent 处理新 prompt =====
+                if profile:
+                    agent_start.record()
+
                 # chunk_id 重置在 _process_prompt_start 中统一处理
                 self._process_prompt_start(
                     prompt_text=text_prompts_list[segment_idx][0],
                     prompt_id=segment_idx + 1,
                     is_first_prompt=False
                 )
+
+                if profile:
+                    agent_end.record()
+                    torch.cuda.synchronize()
+                    agent_time = agent_start.elapsed_time(agent_end)
+                    agent_times.append((f"Prompt {segment_idx + 1}", agent_time))
 
                 if DEBUG:
                     print(f"[AgentPipeline] Switched to segment {segment_idx} at frame {current_start_frame}")
@@ -295,6 +346,9 @@ class AgentCausalInferencePipeline(InteractiveCausalInferencePipeline):
             # ===== 5. IAM 帧选择和 bank 更新 (chunk >= 3 时) =====
             self.current_chunk_id += 1
             if self.current_chunk_id >= 3 and self.current_entities:
+                if profile:
+                    memory_start.record()
+
                 self._process_chunk_eviction(
                     current_start_frame=current_start_frame,
                     current_num_frames=current_num_frames
@@ -302,12 +356,37 @@ class AgentCausalInferencePipeline(InteractiveCausalInferencePipeline):
                 # ===== 6. 将 IAM 的帧 KV 注入 kv_bank =====
                 self._inject_iam_memory_to_bank()
 
+                if profile:
+                    memory_end.record()
+                    torch.cuda.synchronize()
+                    memory_time = memory_start.elapsed_time(memory_end)
+                    memory_times.append((f"Chunk {block_idx}", memory_time))
+
+            if profile:
+                block_end.record()
+                torch.cuda.synchronize()
+                block_time = block_start.elapsed_time(block_end)
+                block_times.append(block_time)
+
             # 更新帧指针
             current_start_frame += current_num_frames
+
+        if profile:
+            diffusion_end.record()
+            torch.cuda.synchronize()
+            diffusion_time = diffusion_start.elapsed_time(diffusion_end)
+            init_time = init_start.elapsed_time(init_end)
+            vae_start.record()
 
         # 解码视频
         video = self.vae.decode_to_pixel(output.to(noise.device), use_cache=False)
         video = (video * 0.5 + 0.5).clamp(0, 1)
+
+        if profile:
+            vae_end.record()
+            torch.cuda.synchronize()
+            vae_time = vae_start.elapsed_time(vae_end)
+
         self.clear_kv_cache()
 
         # 保存 mapping
@@ -315,6 +394,72 @@ class AgentCausalInferencePipeline(InteractiveCausalInferencePipeline):
             self.agent_memory_bank.save_to_json(mapping_path)
             if DEBUG:
                 print(f"[AgentPipeline] Saved mapping to {mapping_path}")
+
+        # ===== Profiling Results =====
+        if profile:
+            total_time = init_time + diffusion_time + vae_time
+            total_agent_time = sum(t for _, t in agent_times)
+            total_memory_time = sum(t for _, t in memory_times)
+
+            print("\n" + "=" * 70)
+            print("IAM Agent Pipeline Profiling Results")
+            print("=" * 70)
+
+            # Overall breakdown
+            print(f"\n[Overall Performance]")
+            print(f"  - Initialization time:     {init_time:8.2f} ms ({100 * init_time / total_time:5.2f}%)")
+            print(f"  - Diffusion generation:    {diffusion_time:8.2f} ms ({100 * diffusion_time / total_time:5.2f}%)")
+            print(f"  - VAE decoding:            {vae_time:8.2f} ms ({100 * vae_time / total_time:5.2f}%)")
+            print(f"  - Total time:              {total_time:8.2f} ms")
+            print(f"  - Throughput:              {num_output_frames / (total_time / 1000):8.2f} FPS")
+
+            # IAM-specific breakdown
+            print(f"\n[IAM Components (within diffusion)]")
+            print(f"  - Total LLM Agent time:    {total_agent_time:8.2f} ms ({100 * total_agent_time / diffusion_time:5.2f}% of diffusion)")
+            print(f"  - Total Memory Bank time:  {total_memory_time:8.2f} ms ({100 * total_memory_time / diffusion_time:5.2f}% of diffusion)")
+            print(f"  - Pure diffusion time:     {diffusion_time - total_agent_time - total_memory_time:8.2f} ms ({100 * (diffusion_time - total_agent_time - total_memory_time) / diffusion_time:5.2f}% of diffusion)")
+
+            # Per-prompt agent time
+            if agent_times:
+                print(f"\n[LLM Agent - Per Prompt]")
+                for prompt_name, time_ms in agent_times:
+                    print(f"  - {prompt_name:12s} processing: {time_ms:8.2f} ms")
+
+            # Per-chunk memory bank time (show first 5 and last 5 if many)
+            if memory_times:
+                print(f"\n[Memory Bank - Per Chunk (Chunk 3+)]")
+                if len(memory_times) <= 10:
+                    for chunk_name, time_ms in memory_times:
+                        print(f"  - {chunk_name:12s} eviction:  {time_ms:8.2f} ms")
+                else:
+                    # Show first 5
+                    for chunk_name, time_ms in memory_times[:5]:
+                        print(f"  - {chunk_name:12s} eviction:  {time_ms:8.2f} ms")
+                    print(f"  - ... ({len(memory_times) - 10} chunks omitted)")
+                    # Show last 5
+                    for chunk_name, time_ms in memory_times[-5:]:
+                        print(f"  - {chunk_name:12s} eviction:  {time_ms:8.2f} ms")
+                if memory_times:
+                    avg_memory_time = total_memory_time / len(memory_times)
+                    print(f"  - Average per chunk:       {avg_memory_time:8.2f} ms")
+
+            # Per-block diffusion time
+            print(f"\n[Diffusion - Per Block]")
+            if len(block_times) <= 10:
+                for i, block_time in enumerate(block_times):
+                    print(f"  - Block {i:3d} generation:   {block_time:8.2f} ms ({100 * block_time / diffusion_time:5.2f}% of diffusion)")
+            else:
+                # Show first 5
+                for i in range(5):
+                    print(f"  - Block {i:3d} generation:   {block_times[i]:8.2f} ms ({100 * block_times[i] / diffusion_time:5.2f}% of diffusion)")
+                print(f"  - ... ({len(block_times) - 10} blocks omitted)")
+                # Show last 5
+                for i in range(len(block_times) - 5, len(block_times)):
+                    print(f"  - Block {i:3d} generation:   {block_times[i]:8.2f} ms ({100 * block_times[i] / diffusion_time:5.2f}% of diffusion)")
+            avg_block_time = diffusion_time / len(block_times)
+            print(f"  - Average per block:       {avg_block_time:8.2f} ms")
+
+            print("=" * 70 + "\n")
 
         if return_latents:
             return video, output

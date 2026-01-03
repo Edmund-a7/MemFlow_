@@ -30,7 +30,6 @@ from utils.dataset import TextDataset
 from utils.memory import get_cuda_free_memory_gb, DynamicSwapInstaller
 
 from pipeline.agent_causal_inference import AgentCausalInferencePipeline
-from time import time
 
 
 # ----------------------------- Argument parsing -----------------------------
@@ -229,9 +228,6 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
     text_prompts_list = [[p] for p in prompts]  # Each sample gets a list with one prompt
 
     # Generate video using IAM pipeline (single segment, no switching)
-
-    start = time()
-
     video = pipeline.inference(
         noise=sampled_noise,
         text_prompts_list=text_prompts_list,
@@ -239,10 +235,9 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
         return_latents=False,
         low_memory=low_memory,
         save_mapping=False,  # Don't need mapping for single prompt
+        profile=True,  # Enable profiling
     )
-    end = time()
-    print("Duration:", end - start, "seconds")
-    
+
     current_video = rearrange(video, 'b t c h w -> b t h w c').cpu()
     all_video.append(current_video)
     num_generated_frames += video.shape[1]
