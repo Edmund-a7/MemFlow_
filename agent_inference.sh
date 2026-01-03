@@ -11,4 +11,5 @@ CUDA_VISIBLE_DEVICES=0 torchrun \
   --nproc_per_node=1 \
   --master_port=29501 \
   agent_inference.py \
-  --config_path configs/agent_inference.yaml
+  --config_path configs/agent_inference.yaml\
+  --llm_model_path ./Qwen3-4B-Instruct-2507
