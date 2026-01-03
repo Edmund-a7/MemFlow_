@@ -328,22 +328,8 @@ class AgentCausalInferencePipeline(InteractiveCausalInferencePipeline):
             # 记录输出
             output[:, current_start_frame:current_start_frame + current_num_frames] = denoised_pred.to(output.device)
 
-            # 使用 clean context 更新 cache (但不更新 bank)
-            context_timestep = torch.ones_like(timestep) * self.args.context_noise
-            self.generator(
-                noisy_image_or_video=denoised_pred,
-                conditional_dict=cond_in_use,
-                timestep=context_timestep,
-                kv_cache=self.kv_cache1,
-                kv_bank=self.kv_bank1,
-                crossattn_cache=self.crossattn_cache,
-                current_start=current_start_frame * self.frame_seq_length,
-                update_bank=False,  # 关键: 始终 False，IAM 自己管理
-                q_bank=q_bank,
-                update_cache=True,
-            )
-
             # ===== 5. IAM 帧选择和 bank 更新 (chunk >= 3 时) =====
+            # 关键：必须在 clean context 更新前获取被驱逐的 chunk
             self.current_chunk_id += 1
             if self.current_chunk_id >= 3 and self.current_entities:
                 if profile:
@@ -361,6 +347,21 @@ class AgentCausalInferencePipeline(InteractiveCausalInferencePipeline):
                     torch.cuda.synchronize()
                     memory_time = memory_start.elapsed_time(memory_end)
                     memory_times.append((f"Chunk {block_idx}", memory_time))
+
+            # 使用 clean context 更新 cache (但不更新 bank)
+            context_timestep = torch.ones_like(timestep) * self.args.context_noise
+            self.generator(
+                noisy_image_or_video=denoised_pred,
+                conditional_dict=cond_in_use,
+                timestep=context_timestep,
+                kv_cache=self.kv_cache1,
+                kv_bank=self.kv_bank1,
+                crossattn_cache=self.crossattn_cache,
+                current_start=current_start_frame * self.frame_seq_length,
+                update_bank=False,  # 关键: 始终 False，IAM 自己管理
+                q_bank=q_bank,
+                update_cache=True,
+            )
 
             if profile:
                 block_end.record()
@@ -575,14 +576,22 @@ class AgentCausalInferencePipeline(InteractiveCausalInferencePipeline):
 
     def _get_evicted_chunk_kv(self) -> Optional[List[Dict[str, torch.Tensor]]]:
         """
-        获取当前 chunk 的 KV cache (所有 30 个 block)
+        获取即将被驱逐的 chunk 的 KV cache (所有 30 个 block)
 
-        IAM 的帧选择逻辑与 MemFlow 不同:
-        - MemFlow: 直接存储最新生成的 1 帧 (无选择)
-        - IAM: 从当前 chunk (3帧) 中选择最相关的 1 帧
+        IAM 的帧选择逻辑：
+        - 从 Local 窗口中**即将被驱逐**的 chunk 中选择最相关的 1 帧存入 Memory Bank
+        - Local 窗口大小 = 2 * chunk_length (6 帧 = 2 chunks)
+        - 当生成新 chunk 时，最旧的 chunk 会被驱逐
 
-        因此这里获取的是"当前刚生成的 chunk"的 KV，
-        而不是"即将被驱逐的旧 chunk"
+        关键：必须在 clean context 更新 cache **之前**调用，此时：
+        - local_end 指向旧的位置（还没加入新 chunk）
+        - 被驱逐的 chunk 在 [local_end - 2*chunk_length, local_end - chunk_length)
+
+        示例（Chunk 3 生成时）:
+        - local_end = 6 * 16 = 96 (C1+C2 的末尾)
+        - chunk_start = max(0, 96 - 2*48) = 0  (C1 起始)
+        - chunk_end = max(0, 96 - 48) = 48     (C1 末尾)
+        - 返回 C1 的 KV ✅
 
         Returns:
             List[{"k": [B, L, H, D], "v": [B, L, H, D]}] 或 None
@@ -594,19 +603,21 @@ class AgentCausalInferencePipeline(InteractiveCausalInferencePipeline):
         cache = self.kv_cache1[0]
         k = cache["k"]
 
-        # 获取当前 cache 的有效长度
+        # 获取当前 cache 的有效长度（clean context 更新前）
         local_end = cache["local_end_index"].item()
 
-        # 计算当前 chunk 的位置 (最近生成的 chunk)
+        # 计算被驱逐的 chunk 的位置
         # num_frame_per_block = 3 (每个 chunk 3 帧)
         chunk_length = self.num_frame_per_block * self.frame_seq_length
-        chunk_start = max(0, local_end - chunk_length)
-        chunk_end = local_end
+
+        # 被驱逐的 chunk 在 Local 窗口的最前面
+        chunk_start = max(0, local_end - 2 * chunk_length)
+        chunk_end = max(0, local_end - chunk_length)
 
         if chunk_end <= chunk_start or chunk_end > k.shape[1]:
             return None
 
-        # 获取所有 block 的当前 chunk KV
+        # 获取所有 block 的被驱逐 chunk KV
         all_blocks_kv = []
         for block_idx in range(len(self.kv_cache1)):
             block_cache = self.kv_cache1[block_idx]
