@@ -331,10 +331,14 @@ OUTPUT FORMAT (JSON only, no explanation):
         # 1. 检查是否包含明确的新实体标记
         is_explicitly_new = any(marker in entity_lower for marker in self.NEW_ENTITY_MARKERS)
         if is_explicitly_new:
-            return self._allocate_new_id()
+            new_id = self._allocate_new_id()
+            print(f"[DEBUG] _match_or_allocate: entity='{entity.entity}' has NEW marker, allocated new_id={new_id}")
+            return new_id
 
         if not global_registry:
-            return self._allocate_new_id()
+            new_id = self._allocate_new_id()
+            print(f"[DEBUG] _match_or_allocate: entity='{entity.entity}', registry empty, allocated new_id={new_id}, _next_id now={self._next_id}")
+            return new_id
 
         # 2. 拼接 entity + attrs 为完整描述
         entity_desc = f"{entity.entity}: {', '.join(entity.attrs)}" if entity.attrs else entity.entity
@@ -360,10 +364,13 @@ Output JSON only: {{"matched_id": <number or null>}}"""
 
         matched_id = self._parse_matching_response(response)
 
+        print(f"[DEBUG] _match_or_allocate: entity='{entity.entity}', matched_id={matched_id}, registry_keys={list(global_registry.keys())}, _next_id={self._next_id}")
         if matched_id is not None and str(matched_id) in global_registry:
             return matched_id
         else:
-            return self._allocate_new_id()
+            new_id = self._allocate_new_id()
+            print(f"[DEBUG] _match_or_allocate: allocated new_id={new_id}")
+            return new_id
 
     def _format_registry_for_llm(self, global_registry: Dict[str, Dict]) -> str:
         """格式化registry信息为entity: attrs描述格式"""
