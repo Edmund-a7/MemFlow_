@@ -363,6 +363,7 @@ Output JSON only: {{"matched_id": <number or null>}}"""
 
         matched_id = self._parse_matching_response(response)
 
+        print(f"  [Match] parsed matched_id={matched_id}, registry_keys={list(global_registry.keys())}")
         if matched_id is not None and str(matched_id) in global_registry:
             print(f"  [Match] '{entity.entity}' LLM-matched -> ID {matched_id}")
             return matched_id
