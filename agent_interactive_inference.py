@@ -47,6 +47,8 @@ parser.add_argument("--save_dir", type=str, default="data/agent_frames",
                     help="Directory to save frame data")
 parser.add_argument("--mapping_path", type=str, default=None,
                     help="Path to save mapping.json (default: output_folder/mapping.json)")
+parser.add_argument("--save_frames_to_disk", action="store_true",
+                    help="Save frame KV to disk (default: False, keep in memory only for better performance)")
 args = parser.parse_args()
 
 config = OmegaConf.load(args.config_path)
@@ -92,6 +94,7 @@ torch.set_grad_enabled(False)
 llm_model_path = args.llm_model_path if args.llm_model_path != "../Qwen3-0.6B" else getattr(config, "llm_model_path", "../Qwen3-0.6B")
 max_memory_frames = args.max_memory_frames if args.max_memory_frames != 3 else getattr(config, "max_memory_frames", 3)
 save_dir = args.save_dir if args.save_dir != "data/agent_frames" else getattr(config, "save_dir", "data/agent_frames")
+save_frames_to_disk = args.save_frames_to_disk or getattr(config, "save_frames_to_disk", False)
 
 if local_rank == 0:
     print("=" * 60)
@@ -100,6 +103,7 @@ if local_rank == 0:
     print(f"LLM Model Path: {llm_model_path}")
     print(f"Max Memory Frames: {max_memory_frames}")
     print(f"Save Directory: {save_dir}")
+    print(f"Save Frames to Disk: {save_frames_to_disk}")
     print("=" * 60)
 
 pipeline = AgentCausalInferencePipeline(
@@ -107,7 +111,8 @@ pipeline = AgentCausalInferencePipeline(
     device=device,
     llm_model_path=llm_model_path,
     max_memory_frames=max_memory_frames,
-    save_dir=save_dir
+    save_dir=save_dir,
+    save_frames_to_disk=save_frames_to_disk
 )
 
 # ----------------------------- Load base checkpoint -----------------------------

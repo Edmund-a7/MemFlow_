@@ -51,7 +51,8 @@ class AgentCausalInferencePipeline(InteractiveCausalInferencePipeline):
         vae: WanVAEWrapper | None = None,
         llm_model_path: str = "../Qwen3-0.6B",
         max_memory_frames: int = 3,
-        save_dir: str = "data/agent_frames"
+        save_dir: str = "data/agent_frames",
+        save_frames_to_disk: bool = False
     ):
         """
         初始化 Agent Pipeline
@@ -65,6 +66,7 @@ class AgentCausalInferencePipeline(InteractiveCausalInferencePipeline):
             llm_model_path: LLM 模型路径
             max_memory_frames: 最大记忆帧数量
             save_dir: 帧数据保存目录
+            save_frames_to_disk: 是否将帧 KV 保存到磁盘 (默认False，仅保存在内存中以提升性能)
         """
         super().__init__(args, device, generator=generator, text_encoder=text_encoder, vae=vae)
 
@@ -77,7 +79,8 @@ class AgentCausalInferencePipeline(InteractiveCausalInferencePipeline):
             max_memory_frames=max_memory_frames,
             frame_seq_length=self.frame_seq_length,
             num_transformer_blocks=self.num_transformer_blocks,
-            save_dir=save_dir
+            save_dir=save_dir,
+            save_frames_to_disk=save_frames_to_disk
         )
 
         # 状态追踪
@@ -89,6 +92,7 @@ class AgentCausalInferencePipeline(InteractiveCausalInferencePipeline):
         self.llm_model_path = llm_model_path
         self.max_memory_frames = max_memory_frames
         self.save_dir = save_dir
+        self.save_frames_to_disk = save_frames_to_disk
 
         # 确保保存目录存在
         os.makedirs(save_dir, exist_ok=True)
@@ -494,6 +498,8 @@ class AgentCausalInferencePipeline(InteractiveCausalInferencePipeline):
         self.current_chunk_id = 0
         self.current_entities = []
         self.agent_memory_bank.clear()
+        # 重置 LLM Agent 的 ID 计数器，确保每次推理 global_registry 从 1 开始
+        self.llm_agent._next_id = 1
 
     def _process_prompt_start(self,
                               prompt_text: str,

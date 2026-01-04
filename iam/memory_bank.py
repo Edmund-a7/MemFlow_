@@ -61,7 +61,8 @@ class MemoryBank:
                  max_memory_frames: int = 3,
                  frame_seq_length: int = 1560,
                  num_transformer_blocks: int = 30,
-                 save_dir: str = "data"):
+                 save_dir: str = "data",
+                 save_frames_to_disk: bool = False):
         """
         初始化Memory Bank
 
@@ -71,12 +72,14 @@ class MemoryBank:
             frame_seq_length: 每帧的序列长度
             num_transformer_blocks: transformer block 数量 (默认30)
             save_dir: 帧数据保存目录
+            save_frames_to_disk: 是否将帧 KV 保存到磁盘 (默认False，仅保存在内存中以提升性能)
         """
         self.text_encoder = text_encoder
         self.max_memory_frames = max_memory_frames
         self.frame_seq_length = frame_seq_length
         self.num_transformer_blocks = num_transformer_blocks
         self.save_dir = save_dir
+        self.save_frames_to_disk = save_frames_to_disk
 
         # 核心数据结构
         self.global_registry: Dict[str, Dict] = {}
@@ -369,6 +372,9 @@ class MemoryBank:
 
     def _save_frame_kv(self, frame_id: str, frame_kv: List[Dict[str, torch.Tensor]]) -> None:
         """保存帧KV到文件 (所有 block)"""
+        if not self.save_frames_to_disk:
+            return  # 仅在内存中保存，跳过磁盘 I/O
+
         path = os.path.join(self.save_dir, f"{frame_id}.pt")
         torch.save(frame_kv, path)
 
