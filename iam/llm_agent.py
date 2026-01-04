@@ -331,7 +331,6 @@ OUTPUT FORMAT (JSON only, no explanation):
         # 1. 检查是否包含明确的新实体标记
         is_explicitly_new = any(marker in entity_lower for marker in self.NEW_ENTITY_MARKERS)
         if is_explicitly_new:
-            print(f"  [Match] '{entity.entity}' has NEW marker -> new ID")
             return self._allocate_new_id()
 
         if not global_registry:
@@ -359,16 +358,11 @@ Output JSON only: {{"matched_id": <number or null>}}"""
             temperature=0.1
         )
 
-        print(f"  [Match] LLM response for '{entity.entity}': {response[:200]}")
-
         matched_id = self._parse_matching_response(response)
 
-        print(f"  [Match] parsed matched_id={matched_id}, registry_keys={list(global_registry.keys())}")
         if matched_id is not None and str(matched_id) in global_registry:
-            print(f"  [Match] '{entity.entity}' LLM-matched -> ID {matched_id}")
             return matched_id
         else:
-            print(f"  [Match] '{entity.entity}' no match -> new ID")
             return self._allocate_new_id()
 
     def _format_registry_for_llm(self, global_registry: Dict[str, Dict]) -> str:

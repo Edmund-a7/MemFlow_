@@ -499,8 +499,8 @@ class AgentCausalInferencePipeline(InteractiveCausalInferencePipeline):
         self.current_entities = []
         self.agent_memory_bank.clear()
         # 重置 LLM Agent 的 ID 计数器，确保每次推理 global_registry 从 1 开始
-        self.llm_agent._next_id = 1
-        print(f"[DEBUG] _reset_agent_state called: _next_id={self.llm_agent._next_id}, registry={self.agent_memory_bank.global_registry}")
+        # 注意: LLMAgent 内部使用 id_manager (GlobalIDManager 实例) 来管理 ID
+        self.llm_agent.id_manager._next_id = 1
 
     def _process_prompt_start(self,
                               prompt_text: str,
