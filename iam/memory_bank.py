@@ -191,7 +191,10 @@ class MemoryBank:
         Returns:
             检索到的frame_id列表
         """
+        print(f"[DEBUG] retrieve_initial_frames: entity_ids={entity_ids}, archive_size={len(self.frame_archive)}")
+
         if not self.frame_archive:
+            print(f"[DEBUG] retrieve_initial_frames: No frames in archive")
             return []
 
         entity_id_strs = [str(eid) for eid in entity_ids]
@@ -206,17 +209,23 @@ class MemoryBank:
             if match_count > 0:
                 # 综合考虑匹配数量和原始分数
                 combined_score = match_count * 10 + frame_info.score
-                frame_scores.append((frame_id, combined_score, frame_info.score))
+                frame_scores.append((frame_id, combined_score, frame_info.score, match_count))
+
+        print(f"[DEBUG] retrieve_initial_frames: {len(frame_scores)} frames matched entities")
 
         if not frame_scores:
             # 没有匹配的帧，返回分数最高的帧
             all_frames = [(fid, fi.score) for fid, fi in self.frame_archive.items()]
             all_frames.sort(key=lambda x: x[1], reverse=True)
             selected = [f[0] for f in all_frames[:self.max_memory_frames]]
+            print(f"[DEBUG] retrieve_initial_frames: No entity match, using top-score frames: {selected}")
         else:
             # 按综合分数排序
             frame_scores.sort(key=lambda x: x[1], reverse=True)
             selected = [f[0] for f in frame_scores[:self.max_memory_frames]]
+            print(f"[DEBUG] retrieve_initial_frames: Selected by entity match:")
+            for fid, combined, orig, match in frame_scores[:self.max_memory_frames]:
+                print(f"  - {fid}: match_count={match}, combined_score={combined:.4f}, orig_score={orig:.4f}")
 
         # 更新active memory
         self.frame_active_memory = selected.copy()
@@ -266,6 +275,9 @@ class MemoryBank:
         # 选择最高分帧
         best_frame_idx = frame_scores.argmax().item()
         best_score = frame_scores[best_frame_idx].item()
+
+        print(f"[DEBUG] select_frame_from_chunk: frame_scores={frame_scores.tolist()}")
+        print(f"[DEBUG] select_frame_from_chunk: best_frame_idx={best_frame_idx}, best_score={best_score:.4f}")
 
         # 生成frame_id
         frame_id = f"p{prompt_id}_c{chunk_id}_f{best_frame_idx}"
@@ -403,15 +415,19 @@ class MemoryBank:
         if frame_id not in self.frame_archive:
             return
 
+        old_memory = self.frame_active_memory.copy()
+
         if len(self.frame_active_memory) < self.max_memory_frames:
             # 未达上限，直接添加
             if frame_id not in self.frame_active_memory:
                 self.frame_active_memory.append(frame_id)
+                print(f"[DEBUG] update_active_memory: Added {frame_id} (score={score:.4f}), memory not full")
         else:
             # 已达上限，比较分数
             # 找到当前active memory中分数最低的帧
             min_score = float('inf')
             min_idx = -1
+            min_fid = None
 
             for idx, fid in enumerate(self.frame_active_memory):
                 if fid in self.frame_archive:
@@ -419,10 +435,14 @@ class MemoryBank:
                     if finfo.score < min_score:
                         min_score = finfo.score
                         min_idx = idx
+                        min_fid = fid
 
             # 如果新帧分数更高，替换最低分帧
             if score > min_score and min_idx >= 0:
                 self.frame_active_memory[min_idx] = frame_id
+                print(f"[DEBUG] update_active_memory: Replaced {min_fid}(score={min_score:.4f}) with {frame_id}(score={score:.4f})")
+            else:
+                print(f"[DEBUG] update_active_memory: Kept existing frames, new score {score:.4f} <= min_score {min_score:.4f}")
 
     def get_memory_kv(self, device: torch.device = None) -> Optional[List[Dict[str, torch.Tensor]]]:
         """

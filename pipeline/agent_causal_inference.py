@@ -518,6 +518,12 @@ class AgentCausalInferencePipeline(InteractiveCausalInferencePipeline):
         self.current_prompt_id = prompt_id
         self.current_chunk_id = 0
 
+        print(f"\n{'='*60}")
+        print(f"[DEBUG] === PROMPT {prompt_id} START ===")
+        print(f"[DEBUG] prompt_text: {prompt_text[:100]}...")
+        print(f"[DEBUG] is_first_prompt: {is_first_prompt}")
+        print(f"{'='*60}")
+
         # 1. LLM Agent 提取实体并分配 ID
         entities, registry_update = self.llm_agent.process_prompt(
             prompt=prompt_text,
@@ -527,6 +533,12 @@ class AgentCausalInferencePipeline(InteractiveCausalInferencePipeline):
 
         self.current_entities = entities
 
+        print(f"[DEBUG] Extracted {len(entities)} entities:")
+        for e in entities:
+            print(f"  - entity='{e.entity}', global_id={e.global_id}, attrs={e.attrs}")
+
+        print(f"[DEBUG] Registry update: {list(registry_update.keys()) if registry_update else 'None'}")
+
         if DEBUG:
             print(f"[AgentPipeline] Prompt {prompt_id} entities:")
             for e in entities:
@@ -535,16 +547,21 @@ class AgentCausalInferencePipeline(InteractiveCausalInferencePipeline):
         # 2. 更新 Memory Bank 的 registry
         self.agent_memory_bank.register_entities(entities, prompt_id, registry_update)
 
+        print(f"[DEBUG] Global registry after update: {list(self.agent_memory_bank.global_registry.keys())}")
+
         # 3. 检索初始记忆帧 (非首个 prompt)
         if not is_first_prompt and entities:
             entity_ids = self.agent_memory_bank.get_entity_ids(entities)
+            print(f"[DEBUG] Retrieving initial frames for entity_ids: {entity_ids}")
             retrieved_frames = self.agent_memory_bank.retrieve_initial_frames(entity_ids)
+            print(f"[DEBUG] Retrieved initial frames: {retrieved_frames}")
 
             if DEBUG:
                 print(f"[AgentPipeline] Retrieved initial frames: {retrieved_frames}")
 
             # 注入检索到的帧
             self._inject_iam_memory_to_bank()
+            print(f"[DEBUG] Injected memory frames to kv_bank")
 
     def _process_chunk_eviction(self,
                                 current_start_frame: int,
@@ -565,6 +582,10 @@ class AgentCausalInferencePipeline(InteractiveCausalInferencePipeline):
         if evicted_chunk_kv is None:
             return
 
+        print(f"\n[DEBUG] --- CHUNK {self.current_chunk_id} EVICTION (Prompt {self.current_prompt_id}) ---")
+        print(f"[DEBUG] current_start_frame={current_start_frame}, current_num_frames={current_num_frames}")
+        print(f"[DEBUG] evicted_chunk_kv shape: k={evicted_chunk_kv[0]['k'].shape}")
+
         # IAM 帧选择 (使用 crossattn_cache)
         entity_ids = self.agent_memory_bank.get_entity_ids(self.current_entities)
         frame_id, score = self.agent_memory_bank.select_frame_from_chunk(
@@ -575,8 +596,13 @@ class AgentCausalInferencePipeline(InteractiveCausalInferencePipeline):
             current_entity_ids=entity_ids
         )
 
+        print(f"[DEBUG] IAM selected frame: {frame_id}, score={score:.4f}")
+
         # 更新 active memory
         self.agent_memory_bank.update_active_memory(frame_id, score)
+
+        print(f"[DEBUG] Active memory after update: {self.agent_memory_bank.frame_active_memory}")
+        print(f"[DEBUG] Frame archive size: {len(self.agent_memory_bank.frame_archive)}")
 
         if DEBUG:
             print(f"[AgentPipeline] IAM selected frame {frame_id} with score {score:.4f}")
@@ -650,10 +676,15 @@ class AgentCausalInferencePipeline(InteractiveCausalInferencePipeline):
         )
 
         if memory_kv is None:
+            print(f"[DEBUG] _inject_iam_memory_to_bank: No memory KV available")
             return
 
         # memory_kv 是 List[{"k": ..., "v": ...}]，每个 block 一个
         memory_length = memory_kv[0]["k"].shape[1]
+        num_frames_in_memory = memory_length // self.frame_seq_length
+
+        print(f"[DEBUG] _inject_iam_memory_to_bank: memory_length={memory_length} tokens ({num_frames_in_memory} frames)")
+        print(f"[DEBUG] Active memory frames being injected: {self.agent_memory_bank.frame_active_memory}")
 
         # 将 IAM 的帧 KV 注入到每个 transformer block 的 bank
         for block_idx in range(len(self.kv_bank1)):
@@ -672,6 +703,8 @@ class AgentCausalInferencePipeline(InteractiveCausalInferencePipeline):
             # 更新索引
             bank["local_end_index"].fill_(write_length)
             bank["global_end_index"].fill_(write_length)
+
+        print(f"[DEBUG] Injected {memory_length} tokens to all {len(self.kv_bank1)} blocks")
 
         if DEBUG:
             print(f"[AgentPipeline] Injected {memory_length} tokens from IAM to kv_bank (all {len(self.kv_bank1)} blocks)")
