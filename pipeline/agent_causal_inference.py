@@ -586,14 +586,15 @@ class AgentCausalInferencePipeline(InteractiveCausalInferencePipeline):
         print(f"[DEBUG] current_start_frame={current_start_frame}, current_num_frames={current_num_frames}")
         print(f"[DEBUG] evicted_chunk_kv shape: k={evicted_chunk_kv[0]['k'].shape}")
 
-        # IAM 帧选择 (使用 crossattn_cache)
+        # IAM 帧选择 (使用 entity-attr 字符串)
         entity_ids = self.agent_memory_bank.get_entity_ids(self.current_entities)
         frame_id, score = self.agent_memory_bank.select_frame_from_chunk(
             evicted_chunk_kv=evicted_chunk_kv,
             crossattn_cache=self.crossattn_cache,
             prompt_id=self.current_prompt_id,
             chunk_id=self.current_chunk_id,
-            current_entity_ids=entity_ids
+            current_entity_ids=entity_ids,
+            current_entities=self.current_entities
         )
 
         print(f"[DEBUG] IAM selected frame: {frame_id}, score={score:.4f}")

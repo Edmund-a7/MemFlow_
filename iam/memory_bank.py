@@ -239,12 +239,12 @@ class MemoryBank:
                                 crossattn_cache: List[Dict[str, torch.Tensor]],
                                 prompt_id: int,
                                 chunk_id: int,
-                                current_entity_ids: List[int]) -> Tuple[str, float]:
+                                current_entity_ids: List[int],
+                                current_entities: Optional[List['EntityStruct']] = None) -> Tuple[str, float]:
         """
         从驱逐的chunk中选择最佳帧
 
-        使用 crossattn_cache["k"] 与 evicted_chunk_kv 做交叉注意力计算分数
-        (与 MemFlow 的 compress_kv_bank 方法一致)
+        使用 entity-attr 拼接字符串编码后的特征与 evicted_chunk_kv 做交叉注意力计算分数
 
         Args:
             evicted_chunk_kv: 驱逐chunk的KV cache (所有30个block)
@@ -254,22 +254,28 @@ class MemoryBank:
             prompt_id: 当前prompt序号
             chunk_id: 当前chunk序号
             current_entity_ids: 当前prompt的实体ID列表
+            current_entities: 当前prompt的实体列表 (用于构建 entity-attr 查询)
 
         Returns:
             (frame_id, score) - 选中的帧ID和分数
         """
-        # 检查 crossattn_cache 是否已初始化
-        if not crossattn_cache[0].get("is_init", False):
-            # crossattn_cache 未初始化，返回默认选择第一帧
-            # 这种情况正常不应该发生，因为 chunk >= 3 时 cache 应该已经初始化
-            import warnings
-            warnings.warn("[MemoryBank] crossattn_cache not initialized, selecting first frame by default")
-            frame_scores = torch.ones(evicted_chunk_kv[0]["k"].shape[1] // self.frame_seq_length)
+        # 检查 text_encoder 和 entities 是否可用
+        if self.text_encoder is None or current_entities is None or len(current_entities) == 0:
+            # 无法使用 entity-attr 方式，回退到 crossattn_cache
+            if not crossattn_cache[0].get("is_init", False):
+                import warnings
+                warnings.warn("[MemoryBank] crossattn_cache not initialized, selecting first frame by default")
+                frame_scores = torch.ones(evicted_chunk_kv[0]["k"].shape[1] // self.frame_seq_length)
+            else:
+                frame_scores = self._compute_frame_scores_with_crossattn(
+                    evicted_chunk_kv[0],
+                    crossattn_cache[0]
+                )
         else:
-            # 使用第一个 block 计算帧分数 (所有 block 的分数应该相似)
-            frame_scores = self._compute_frame_scores_with_crossattn(
+            # 使用 entity-attr 拼接字符串计算帧分数
+            frame_scores = self._compute_frame_scores_with_entity_attrs(
                 evicted_chunk_kv[0],
-                crossattn_cache[0]
+                current_entities
             )
 
         # 选择最高分帧
@@ -356,6 +362,83 @@ class MemoryBank:
             frame_scores.append(frame_score)
 
         return torch.tensor(frame_scores, device=chunk_k.device)
+
+    def _compute_frame_scores_with_entity_attrs(self,
+                                                 chunk_kv: Dict[str, torch.Tensor],
+                                                 entities: List['EntityStruct']) -> torch.Tensor:
+        """
+        使用 entity-attr 拼接字符串编码后的特征计算每帧分数
+
+        流程:
+        1. 构建 entity-attr 查询字符串 (如 "young man late 20s messy black hair")
+        2. 使用 text_encoder 编码为特征
+        3. 与 chunk_kv 做注意力计算
+
+        Args:
+            chunk_kv: 单个 block 的 chunk KV, {"k": [B, L, H, D], "v": [B, L, H, D]}
+            entities: 实体列表
+
+        Returns:
+            每帧的分数 [num_frames]
+        """
+        chunk_k = chunk_kv["k"]  # [B, L, H, D]
+        B, L, H, D = chunk_k.shape
+        device = chunk_k.device
+
+        # 计算帧数
+        num_frames = L // self.frame_seq_length
+        if num_frames == 0:
+            return torch.tensor([1.0], device=device)
+
+        # 构建 entity-attr 查询字符串
+        query_text = self.build_entity_attrs_query(entities)
+        print(f"[DEBUG] Entity-attr query: '{query_text}'")
+
+        # 使用 text_encoder 编码
+        with torch.no_grad():
+            text_output = self.text_encoder([query_text])
+            text_embeds = text_output["prompt_embeds"]  # [1, seq_len, dim]
+
+        # text_embeds 是原始 T5 输出 [1, seq_len, 2048]
+        # 需要投影到与 chunk_k 相同的维度
+        # chunk_k 的 head_dim D 通常是 128, 总维度是 H * D
+        # 这里我们直接用 text_embeds 做相似度计算 (简化版)
+
+        # 将 text_embeds 移到正确的设备
+        text_embeds = text_embeds.to(device)  # [1, seq_len, 2048]
+
+        # 获取 chunk_k 的每帧平均特征
+        # chunk_k: [B, L, H, D] -> reshape to [B, num_frames, frame_seq_length, H*D]
+        chunk_k_flat = chunk_k.view(B, L, H * D)  # [B, L, H*D]
+
+        # 对每帧的 tokens 取平均
+        frame_features = []
+        for i in range(num_frames):
+            start = i * self.frame_seq_length
+            end = (i + 1) * self.frame_seq_length
+            frame_feat = chunk_k_flat[:, start:end, :].mean(dim=1)  # [B, H*D]
+            frame_features.append(frame_feat)
+        frame_features = torch.stack(frame_features, dim=1)  # [B, num_frames, H*D]
+
+        # text_embeds 平均池化
+        text_feat = text_embeds.mean(dim=1)  # [1, 2048]
+
+        # 由于维度不匹配 (H*D vs 2048), 我们使用余弦相似度
+        # 先将两者投影到相同维度 (使用简单的 L2 归一化后取前 min(dim1, dim2) 维度)
+        min_dim = min(frame_features.shape[-1], text_feat.shape[-1])
+        frame_feat_proj = F.normalize(frame_features[..., :min_dim], dim=-1)  # [B, num_frames, min_dim]
+        text_feat_proj = F.normalize(text_feat[..., :min_dim], dim=-1)  # [1, min_dim]
+
+        # 计算余弦相似度
+        # frame_feat_proj: [B, num_frames, min_dim]
+        # text_feat_proj: [1, min_dim] -> [1, 1, min_dim]
+        text_feat_proj = text_feat_proj.unsqueeze(1)  # [1, 1, min_dim]
+        similarity = (frame_feat_proj * text_feat_proj).sum(dim=-1)  # [B, num_frames]
+
+        # 返回相似度分数 (取第一个 batch)
+        frame_scores = similarity[0]  # [num_frames]
+
+        return frame_scores
 
     def _extract_frame_kv_all_blocks(self,
                                       all_blocks_kv: List[Dict[str, torch.Tensor]],
