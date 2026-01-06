@@ -240,11 +240,14 @@ class MemoryBank:
                                 prompt_id: int,
                                 chunk_id: int,
                                 current_entity_ids: List[int],
-                                current_entities: Optional[List['EntityStruct']] = None) -> Tuple[str, float]:
+                                current_entities: Optional[List['EntityStruct']] = None,
+                                prompt_text: Optional[str] = None) -> Tuple[str, float]:
         """
         从驱逐的chunk中选择最佳帧
 
-        使用 entity-attr 拼接字符串编码后的特征与 evicted_chunk_kv 做交叉注意力计算分数
+        方案 A: 使用 crossattn_cache 计算注意力分数，但通过实体信息加权
+        - 保持原始特征空间对齐
+        - 根据 entity/attrs 在 prompt 中的位置精确加权
 
         Args:
             evicted_chunk_kv: 驱逐chunk的KV cache (所有30个block)
@@ -254,28 +257,24 @@ class MemoryBank:
             prompt_id: 当前prompt序号
             chunk_id: 当前chunk序号
             current_entity_ids: 当前prompt的实体ID列表
-            current_entities: 当前prompt的实体列表 (用于构建 entity-attr 查询)
+            current_entities: 当前prompt的实体列表 (用于构建实体权重)
+            prompt_text: 当前 prompt 文本 (用于精确定位实体位置)
 
         Returns:
             (frame_id, score) - 选中的帧ID和分数
         """
-        # 检查 text_encoder 和 entities 是否可用
-        if self.text_encoder is None or current_entities is None or len(current_entities) == 0:
-            # 无法使用 entity-attr 方式，回退到 crossattn_cache
-            if not crossattn_cache[0].get("is_init", False):
-                import warnings
-                warnings.warn("[MemoryBank] crossattn_cache not initialized, selecting first frame by default")
-                frame_scores = torch.ones(evicted_chunk_kv[0]["k"].shape[1] // self.frame_seq_length)
-            else:
-                frame_scores = self._compute_frame_scores_with_crossattn(
-                    evicted_chunk_kv[0],
-                    crossattn_cache[0]
-                )
+        # 检查 crossattn_cache 是否已初始化
+        if not crossattn_cache[0].get("is_init", False):
+            import warnings
+            warnings.warn("[MemoryBank] crossattn_cache not initialized, selecting first frame by default")
+            frame_scores = torch.ones(evicted_chunk_kv[0]["k"].shape[1] // self.frame_seq_length)
         else:
-            # 使用 entity-attr 拼接字符串计算帧分数
-            frame_scores = self._compute_frame_scores_with_entity_attrs(
+            # 方案 A: 使用 crossattn_cache + 实体聚焦加权
+            frame_scores = self._compute_frame_scores_with_entity_focus(
                 evicted_chunk_kv[0],
-                current_entities
+                crossattn_cache[0],
+                current_entities,
+                prompt_text
             )
 
         # 选择最高分帧
@@ -363,82 +362,181 @@ class MemoryBank:
 
         return torch.tensor(frame_scores, device=chunk_k.device)
 
-    def _compute_frame_scores_with_entity_attrs(self,
-                                                 chunk_kv: Dict[str, torch.Tensor],
-                                                 entities: List['EntityStruct']) -> torch.Tensor:
+    def _compute_frame_scores_with_entity_focus(self,
+                                                  chunk_kv: Dict[str, torch.Tensor],
+                                                  crossattn_cache_block: Dict[str, torch.Tensor],
+                                                  entities: Optional[List['EntityStruct']] = None,
+                                                  prompt_text: Optional[str] = None) -> torch.Tensor:
         """
-        使用 entity-attr 拼接字符串编码后的特征计算每帧分数
+        方案 A: 使用 crossattn_cache 计算帧分数，但聚焦于实体相关的 token
 
-        流程:
-        1. 构建 entity-attr 查询字符串 (如 "young man late 20s messy black hair")
-        2. 使用 text_encoder 编码为特征
-        3. 与 chunk_kv 做注意力计算
+        原理:
+        1. 使用原始 crossattn 方法计算每个 text token 对每帧的注意力分数
+        2. 根据 entity/attrs 在 prompt 中的位置构建权重向量
+        3. 加权聚合得到最终帧分数
+
+        优势:
+        - 保持特征空间对齐（crossattn_cache 与 chunk_kv 在同一空间）
+        - 通过精确定位实体位置加权，聚焦于实体相关的 token
 
         Args:
             chunk_kv: 单个 block 的 chunk KV, {"k": [B, L, H, D], "v": [B, L, H, D]}
-            entities: 实体列表
+            crossattn_cache_block: 单个 block 的 crossattn cache
+            entities: 实体列表（用于构建权重，可选）
+            prompt_text: 原始 prompt 文本（用于精确定位实体位置）
 
         Returns:
             每帧的分数 [num_frames]
         """
         chunk_k = chunk_kv["k"]  # [B, L, H, D]
+        text_q = crossattn_cache_block["k"]  # [B, 512, H, D]
+
         B, L, H, D = chunk_k.shape
-        device = chunk_k.device
+        num_text_tokens = text_q.shape[1]  # 512
 
         # 计算帧数
         num_frames = L // self.frame_seq_length
         if num_frames == 0:
-            return torch.tensor([1.0], device=device)
+            return torch.tensor([1.0], device=chunk_k.device)
 
-        # 构建 entity-attr 查询字符串
-        query_text = self.build_entity_attrs_query(entities)
-        print(f"[DEBUG] Entity-attr query: '{query_text}'")
+        # Step 1: 计算完整的 token-to-position 注意力矩阵
+        # q_reshaped: [B*H, 512, D]
+        # k_reshaped: [B*H, L, D]
+        q_reshaped = text_q.permute(0, 2, 1, 3).reshape(B * H, -1, D)
+        k_reshaped = chunk_k.permute(0, 2, 1, 3).reshape(B * H, L, D)
 
-        # 使用 text_encoder 编码
-        with torch.no_grad():
-            text_output = self.text_encoder([query_text])
-            text_embeds = text_output["prompt_embeds"]  # [1, seq_len, dim]
+        # attn_scores: [B*H, 512, L]
+        attn_scores = torch.bmm(q_reshaped, k_reshaped.transpose(1, 2)) * (D ** -0.5)
 
-        # text_embeds 是原始 T5 输出 [1, seq_len, 2048]
-        # 需要投影到与 chunk_k 相同的维度
-        # chunk_k 的 head_dim D 通常是 128, 总维度是 H * D
-        # 这里我们直接用 text_embeds 做相似度计算 (简化版)
+        # Step 2: 构建实体权重向量 [512]
+        entity_weights = self._build_entity_token_weights(entities, num_text_tokens, prompt_text)
+        entity_weights = entity_weights.to(chunk_k.device)  # [512]
 
-        # 将 text_embeds 移到正确的设备
-        text_embeds = text_embeds.to(device)  # [1, seq_len, 2048]
+        if entities is not None and len(entities) > 0:
+            entity_query = self.build_entity_attrs_query(entities)
+            print(f"[DEBUG] Entity-focus mode: '{entity_query[:50]}...' (weights applied)")
+        else:
+            print(f"[DEBUG] No entities, using uniform weights")
 
-        # 获取 chunk_k 的每帧平均特征
-        # chunk_k: [B, L, H, D] -> reshape to [B, num_frames, frame_seq_length, H*D]
-        chunk_k_flat = chunk_k.view(B, L, H * D)  # [B, L, H*D]
+        # Step 3: 加权聚合
+        # attn_scores: [B*H, 512, L]
+        # entity_weights: [512] -> [1, 512, 1]
+        weights = entity_weights.view(1, -1, 1)  # [1, 512, 1]
 
-        # 对每帧的 tokens 取平均
-        frame_features = []
+        # 加权注意力分数
+        weighted_scores = attn_scores * weights  # [B*H, 512, L]
+
+        # 对 text tokens 加权求和
+        # scores_per_position: [B*H, L]
+        scores_per_position = weighted_scores.sum(dim=1) / (weights.sum() + 1e-8)
+
+        # 对 heads 平均: [B, L]
+        scores_per_position = scores_per_position.view(B, H, L).mean(dim=1)
+
+        # Step 4: 按帧分组
+        frame_scores = []
         for i in range(num_frames):
             start = i * self.frame_seq_length
             end = (i + 1) * self.frame_seq_length
-            frame_feat = chunk_k_flat[:, start:end, :].mean(dim=1)  # [B, H*D]
-            frame_features.append(frame_feat)
-        frame_features = torch.stack(frame_features, dim=1)  # [B, num_frames, H*D]
+            frame_score = scores_per_position[:, start:end].mean()  # scalar
+            frame_scores.append(frame_score)
 
-        # text_embeds 平均池化
-        text_feat = text_embeds.mean(dim=1)  # [1, 2048]
+        return torch.tensor(frame_scores, device=chunk_k.device)
 
-        # 由于维度不匹配 (H*D vs 2048), 我们使用余弦相似度
-        # 先将两者投影到相同维度 (使用简单的 L2 归一化后取前 min(dim1, dim2) 维度)
-        min_dim = min(frame_features.shape[-1], text_feat.shape[-1])
-        frame_feat_proj = F.normalize(frame_features[..., :min_dim], dim=-1)  # [B, num_frames, min_dim]
-        text_feat_proj = F.normalize(text_feat[..., :min_dim], dim=-1)  # [1, min_dim]
+    def _build_entity_token_weights(self,
+                                     entities: Optional[List['EntityStruct']],
+                                     num_tokens: int,
+                                     prompt_text: Optional[str] = None) -> torch.Tensor:
+        """
+        构建实体 token 权重向量
 
-        # 计算余弦相似度
-        # frame_feat_proj: [B, num_frames, min_dim]
-        # text_feat_proj: [1, min_dim] -> [1, 1, min_dim]
-        text_feat_proj = text_feat_proj.unsqueeze(1)  # [1, 1, min_dim]
-        similarity = (frame_feat_proj * text_feat_proj).sum(dim=-1)  # [B, num_frames]
+        策略:
+        - 无实体信息时，返回均匀权重
+        - 有实体信息时，精确定位 entity 和 attrs 在 prompt 中的位置并加权
 
-        # 返回相似度分数 (取第一个 batch)
-        frame_scores = similarity[0]  # [num_frames]
+        Args:
+            entities: 实体列表（可选）
+            num_tokens: token 总数（通常为 512）
+            prompt_text: 原始 prompt 文本（用于精确定位）
 
-        return frame_scores
+        Returns:
+            权重向量 [num_tokens]
+        """
+        weights = torch.ones(num_tokens)
+
+        if entities is None or len(entities) == 0:
+            # 无实体信息，返回均匀权重
+            return weights
+
+        if prompt_text is None or len(prompt_text) == 0:
+            # 无 prompt 文本，使用简单的中间区域加权（fallback）
+            entity_start = int(num_tokens * 0.10)
+            entity_end = int(num_tokens * 0.85)
+            weights[entity_start:entity_end] = 1.5
+            return weights
+
+        # 精确定位 entity 和 attrs 在 prompt 中的位置
+        prompt_lower = prompt_text.lower()
+        prompt_len = len(prompt_text)
+
+        # 收集所有关键词及其在 prompt 中的位置
+        keyword_positions = []  # [(start_ratio, end_ratio), ...]
+
+        for entity in entities:
+            # 查找 entity 名称
+            entity_lower = entity.entity.lower()
+            pos = prompt_lower.find(entity_lower)
+            if pos != -1:
+                start_ratio = pos / prompt_len
+                end_ratio = (pos + len(entity_lower)) / prompt_len
+                keyword_positions.append((start_ratio, end_ratio))
+
+            # 查找每个属性
+            for attr in entity.attrs:
+                attr_lower = attr.lower()
+                pos = prompt_lower.find(attr_lower)
+                if pos != -1:
+                    start_ratio = pos / prompt_len
+                    end_ratio = (pos + len(attr_lower)) / prompt_len
+                    keyword_positions.append((start_ratio, end_ratio))
+
+        if not keyword_positions:
+            # 没有找到任何关键词，使用 fallback
+            entity_start = int(num_tokens * 0.10)
+            entity_end = int(num_tokens * 0.85)
+            weights[entity_start:entity_end] = 1.5
+            return weights
+
+        # 将字符位置比例映射到 token 位置，并应用权重
+        # 假设 token 位置与字符位置大致成比例（简化假设）
+        base_weight = 1.0
+        entity_weight = 2.5  # 实体相关区域的权重
+
+        for start_ratio, end_ratio in keyword_positions:
+            # 扩展一点范围，因为 tokenization 可能跨越边界
+            start_token = max(0, int((start_ratio - 0.02) * num_tokens))
+            end_token = min(num_tokens, int((end_ratio + 0.02) * num_tokens))
+
+            # 应用权重（取最大值，避免重叠区域被覆盖）
+            for i in range(start_token, end_token):
+                weights[i] = max(weights[i].item(), entity_weight)
+
+        # 对非实体区域稍微降权
+        # 特别是开头的场景描述和结尾的镜头描述
+        scene_end = int(num_tokens * 0.08)
+        camera_start = int(num_tokens * 0.92)
+
+        for i in range(scene_end):
+            if weights[i] == base_weight:  # 只降权未被标记为实体的部分
+                weights[i] = 0.7
+
+        for i in range(camera_start, num_tokens):
+            if weights[i] == base_weight:
+                weights[i] = 0.5
+
+        print(f"[DEBUG] Entity keyword positions: {len(keyword_positions)} keywords found")
+
+        return weights
 
     def _extract_frame_kv_all_blocks(self,
                                       all_blocks_kv: List[Dict[str, torch.Tensor]],
@@ -709,6 +807,9 @@ if __name__ == "__main__":
     # 测试帧选择
     print("\n2. Testing frame selection (with mock crossattn_cache)...")
 
+    # 测试用的 prompt 文本
+    test_prompt = "A realistic video of a modern city park. The protagonist in the denim jacket is seated on bench. Another man, 30 years old, wearing glasses and a grey sweater, walks into the frame."
+
     # 模拟所有 block 的 chunk KV
     mock_chunk_kv_all_blocks = []
     for _ in range(num_blocks):
@@ -731,7 +832,9 @@ if __name__ == "__main__":
         crossattn_cache=mock_crossattn_cache,
         prompt_id=1,
         chunk_id=3,
-        current_entity_ids=[1, 2]
+        current_entity_ids=[1, 2],
+        current_entities=entities_p2,
+        prompt_text=test_prompt  # 测试精确定位实体位置
     )
     print(f"Selected frame: {frame_id}, score: {score:.4f}")
     print(f"Frame KV stored for {num_blocks} blocks")
@@ -756,7 +859,9 @@ if __name__ == "__main__":
             crossattn_cache=mock_crossattn_cache,
             prompt_id=1,
             chunk_id=chunk_id,
-            current_entity_ids=[1, 2]
+            current_entity_ids=[1, 2],
+            current_entities=entities_p2,
+            prompt_text=test_prompt  # 测试精确定位实体位置
         )
 
         # 获取更新前的状态

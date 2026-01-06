@@ -87,6 +87,7 @@ class AgentCausalInferencePipeline(InteractiveCausalInferencePipeline):
         self.current_prompt_id = 0
         self.current_chunk_id = 0
         self.current_entities: List[EntityStruct] = []
+        self.current_prompt_text: str = ""  # 当前 prompt 文本，用于精确定位实体位置
 
         # 配置
         self.llm_model_path = llm_model_path
@@ -497,6 +498,7 @@ class AgentCausalInferencePipeline(InteractiveCausalInferencePipeline):
         self.current_prompt_id = 0
         self.current_chunk_id = 0
         self.current_entities = []
+        self.current_prompt_text = ""
         self.agent_memory_bank.clear()
         # 重置 LLM Agent 的 ID 计数器，确保每次推理 global_registry 从 1 开始
         # 注意: LLMAgent 内部使用 id_manager (GlobalIDManager 实例) 来管理 ID
@@ -517,6 +519,7 @@ class AgentCausalInferencePipeline(InteractiveCausalInferencePipeline):
         """
         self.current_prompt_id = prompt_id
         self.current_chunk_id = 0
+        self.current_prompt_text = prompt_text  # 保存当前 prompt 文本，用于精确定位实体位置
 
         print(f"\n{'='*60}")
         print(f"[DEBUG] === PROMPT {prompt_id} START ===")
@@ -586,7 +589,7 @@ class AgentCausalInferencePipeline(InteractiveCausalInferencePipeline):
         print(f"[DEBUG] current_start_frame={current_start_frame}, current_num_frames={current_num_frames}")
         print(f"[DEBUG] evicted_chunk_kv shape: k={evicted_chunk_kv[0]['k'].shape}")
 
-        # IAM 帧选择 (使用 entity-attr 字符串)
+        # IAM 帧选择 (使用 entity-attr 字符串 + prompt 精确定位)
         entity_ids = self.agent_memory_bank.get_entity_ids(self.current_entities)
         frame_id, score = self.agent_memory_bank.select_frame_from_chunk(
             evicted_chunk_kv=evicted_chunk_kv,
@@ -594,7 +597,8 @@ class AgentCausalInferencePipeline(InteractiveCausalInferencePipeline):
             prompt_id=self.current_prompt_id,
             chunk_id=self.current_chunk_id,
             current_entity_ids=entity_ids,
-            current_entities=self.current_entities
+            current_entities=self.current_entities,
+            prompt_text=self.current_prompt_text  # 传入 prompt 文本用于精确定位
         )
 
         print(f"[DEBUG] IAM selected frame: {frame_id}, score={score:.4f}")
